@@ -7,53 +7,37 @@ import matplotlib.pyplot as plt
 from tensorflow.keras import layers
 import tensorflow_addons as tfa
 from PIL import Image, ImageDraw
-from data_process import COCOParser
+from glob import glob
+from scipy.io import loadmat
+
+#from data_process import COCOParser
 
 
 #2408448
-image_size = 896
-patch_size = 8
+image_size = 224
+patch_size = 16
 num_patches = (image_size // patch_size) ** 2
-projection_dim = 448
+projection_dim = 384
 
 
 
-train_ann_dir = "coco2017/annotations/instances_train2017.json"
-train_img_dir = "coco2017/train2017"
+BATCH_SIZE = 4
+NUM_CLASSES = 20
 
-val_img_dir = "coco2017/val2017"
-val_ann_dir = "coco2017/annotations/instances_val2017.json"
+DATA_DIR = "instance-level-human-parsing/instance-level_human_parsing/instance-level_human_parsing/Training"
+NUM_TRAIN_IMAGES = 1000
+NUM_VAL_IMAGES = 50
+
+train_images = sorted(glob(os.path.join(DATA_DIR, "Images/*")))[:NUM_TRAIN_IMAGES]
+train_masks = sorted(glob(os.path.join(DATA_DIR, "Category_ids/*")))[:NUM_TRAIN_IMAGES]
+val_images = sorted(glob(os.path.join(DATA_DIR, "Images/*")))[
+    NUM_TRAIN_IMAGES : NUM_VAL_IMAGES + NUM_TRAIN_IMAGES
+]
+val_masks = sorted(glob(os.path.join(DATA_DIR, "Category_ids/*")))[
+    NUM_TRAIN_IMAGES : NUM_VAL_IMAGES + NUM_TRAIN_IMAGES
+]
 
 
-
-class My_Custom_Generator(keras.utils.Sequence) :
-  
-	def __init__(self, image_filenames, batch_size, coco_annotations_file, coco_images_dir) :
-		self.image_filenames = image_filenames
-		self.batch_size = batch_size
-		self.coco_annotations_file = coco_annotations_file
-		self.coco_images_dir = coco_images_dir
-
-
-	def __len__(self) :
-		return (np.ceil(len(self.image_filenames) / float(self.batch_size))).astype(np.int)
-  
-  
-	def __getitem__(self, idx) :
-		batch_val = self.image_filenames[idx * self.batch_size : (idx+1) * self.batch_size]
-		x_val = []
-		y_val = []
-		
-		coco = COCOParser(self.coco_annotations_file, self.coco_images_dir) 
-		
-		for file_name in batch_val:
-			x, y = coco.getting_data(file_name)
-			if len(x.shape)<3 or len(y.shape)<3:
-				continue
-			x_val.append(x)
-			y_val.append(y)
-		
-		return np.array(x_val), np.array(y_val)
 
 
 
@@ -64,33 +48,46 @@ def main():
 	weight_decay = 0.0001
 	batch_size = 1
 	num_epochs = 100
-	num_heads = 4
+	num_heads = 6
 	transformer_units = [projection_dim]
 	transformer_layers = 18
 	 
-	#data process		
-	total_images_train = sorted(
-		[
-			os.path.join(train_img_dir, fname)
-			for fname in os.listdir(train_img_dir)
-			if fname.endswith(".jpg")
-		]
-	)
+	 #data process
+	def read_image(image_path, mask=False):
+		image = tf.io.read_file(image_path)
+		if mask:
+			image = tf.image.decode_png(image, channels=1)
+			image.set_shape([None, None, 1])
+			image = tf.image.resize(images=image, size=[image_size, image_size])
+		else:
+			image = tf.image.decode_png(image, channels=3)
+			image.set_shape([None, None, 3])
+			image = tf.image.resize(images=image, size=[image_size, image_size])
+			image = tf.keras.applications.resnet50.preprocess_input(image)
+		return image
+    
 
-	total_images_val = sorted(
-		[
-			os.path.join(val_img_dir, fname)
-			for fname in os.listdir(val_img_dir)
-			if fname.endswith(".jpg")
-		]
-	)
+
+	def load_data(image_list, mask_list):
+		image = read_image(image_list)
+		mask = read_image(mask_list, mask=True)
+		return image, mask
+
+
+	def data_generator(image_list, mask_list):
+		dataset = tf.data.Dataset.from_tensor_slices((image_list, mask_list))
+		dataset = dataset.map(load_data, num_parallel_calls=tf.data.AUTOTUNE)
+		dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
+		return dataset
+
+
+	train_dataset = data_generator(train_images, train_masks)
+	val_dataset = data_generator(val_images, val_masks)
 	
-				
-	my_training_batch_generator = My_Custom_Generator(total_images_train, batch_size, train_ann_dir, train_img_dir)
-	my_validation_batch_generator = My_Custom_Generator(total_images_val, batch_size, val_ann_dir, val_img_dir)
+	print("\n\n")
+	print("Train Dataset:", train_dataset)
+	print("Val Dataset:", val_dataset)
 	
-	
-	#history = []
 	
 	model = create_UViT(
 		input_shape,
@@ -105,28 +102,110 @@ def main():
 	model.summary()
 	
 
-	optimizer = tfa.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
-	
-	#compile model
-	model.compile(optimizer=optimizer, loss=keras.losses.MeanSquaredError())
+	#loss = keras.losses.SparseCategoricalCrossentropy(from_logits=False)
+	loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+	model.compile(
+		optimizer=keras.optimizers.Adam(learning_rate=0.001),
+		loss=loss,
+		metrics=["accuracy"],
+	)
+
 	
 	checkpoint_filepath = "logs/"
 	checkpoint_callback = keras.callbacks.ModelCheckpoint(
 		checkpoint_filepath,
-		monitor="val_loss",
+		monitor="accuracy",
 		save_best_only=True,
 		save_weights_only=True
 	)
 	
-	model.fit_generator(generator=my_training_batch_generator,
-		steps_per_epoch = int(80 // batch_size),
-		epochs = 10,
-		verbose = 1,
-		validation_data = my_validation_batch_generator,
-		validation_steps = int(50 // batch_size),
-		callbacks = [
-		checkpoint_callback,
-		keras.callbacks.EarlyStopping(monitor="val_loss", patience=10)])
+	
+	history = model.fit(train_dataset, validation_data=val_dataset, epochs=25)
+		
+		
+
+	plt.plot(history.history["loss"])
+	plt.title("Training Loss")
+	plt.ylabel("loss")
+	plt.xlabel("epoch")
+	plt.show()
+
+	plt.plot(history.history["accuracy"])
+	plt.title("Training Accuracy")
+	plt.ylabel("accuracy")
+	plt.xlabel("epoch")
+	plt.show()
+
+	plt.plot(history.history["val_loss"])
+	plt.title("Validation Loss")
+	plt.ylabel("val_loss")
+	plt.xlabel("epoch")
+	plt.show()
+
+	plt.plot(history.history["val_accuracy"])
+	plt.title("Validation Accuracy")
+	plt.ylabel("val_accuracy")
+	plt.xlabel("epoch")
+	plt.show()
+		
+	# Loading the Colormap
+	colormap = loadmat(
+		"instance-level-human-parsing/instance-level_human_parsing/instance-level_human_parsing/human_colormap.mat"
+	)["colormap"]
+	colormap = colormap * 100
+	colormap = colormap.astype(np.uint8)
+
+
+	def infer(model, image_tensor):
+		predictions = model.predict(np.expand_dims((image_tensor), axis=0))
+		predictions = np.squeeze(predictions)
+		predictions = np.argmax(predictions, axis=2)
+		return predictions
+
+
+	def decode_segmentation_masks(mask, colormap, n_classes):
+		r = np.zeros_like(mask).astype(np.uint8)
+		g = np.zeros_like(mask).astype(np.uint8)
+		b = np.zeros_like(mask).astype(np.uint8)
+		for l in range(0, n_classes):
+			idx = mask == l
+			r[idx] = colormap[l, 0]
+			g[idx] = colormap[l, 1]
+			b[idx] = colormap[l, 2]
+		rgb = np.stack([r, g, b], axis=2)
+		return rgb
+
+
+	def get_overlay(image, colored_mask):
+		image = tf.keras.utils.array_to_img(image)
+		image = np.array(image).astype(np.uint8)
+		overlay = cv2.addWeighted(image, 0.35, colored_mask, 0.65, 0)
+		return overlay
+
+
+	def plot_samples_matplotlib(display_list, figsize=(5, 3)):
+		_, axes = plt.subplots(nrows=1, ncols=len(display_list), figsize=figsize)
+		for i in range(len(display_list)):
+			if display_list[i].shape[-1] == 3:
+				axes[i].imshow(tf.keras.utils.array_to_img(display_list[i]))
+			else:
+				axes[i].imshow(display_list[i])
+		plt.show()
+
+
+	def plot_predictions(images_list, colormap, model):
+		for image_file in images_list:
+			image_tensor = read_image(image_file)
+			prediction_mask = infer(image_tensor=image_tensor, model=model)
+			prediction_colormap = decode_segmentation_masks(prediction_mask, colormap, 20)
+			overlay = get_overlay(image_tensor, prediction_colormap)
+			plot_samples_matplotlib(
+				[image_tensor, overlay, prediction_colormap], figsize=(18, 14)
+			)
+		
+		
+
+	plot_predictions(train_images[:4], colormap, model=model)
 			
 	
 	
@@ -217,17 +296,25 @@ def create_UViT(
 		#skip conncetion
 		encoded_patches = layers.Add()([x3, x2])
 		
-		
-		#output er jhamela main karon projection_dim. ekhane 64 kno dilo????
 	
-	#segmentation fpn(feature pyramid network) head
-	encoded_patches = layers.Reshape((224,224,112))(encoded_patches)
-	encoded_patches = layers.Conv2DTranspose(112, (7,7),strides=(2,2),activation="relu", padding="same")(encoded_patches)
-	encoded_patches = layers.Conv2DTranspose(64, (7,7),activation="relu", padding="same")(encoded_patches)
-	encoded_patches = layers.Conv2DTranspose(32, (7,7),strides=(2,2),activation="relu", padding="same")(encoded_patches)
-	encoded_patches = layers.Conv2DTranspose(16, (7,7),activation="relu", padding="same")(encoded_patches)
-	encoded_patches = layers.Conv2DTranspose(3, (7,7),activation="relu", padding="same")(encoded_patches)
+	#FPN	
+	encoded_patches = layers.Reshape((14,14,384))(encoded_patches)
+	
+	encoded_patches = layers.Conv2D(256,(3,3),padding='same')(encoded_patches)
+	encoded_patches = layers.UpSampling2D(size=(image_size // 2 // 
+	encoded_patches.shape[1], image_size // 2 // encoded_patches.shape[2]),
+		interpolation="bilinear",
+	)(encoded_patches)
+	
+	encoded_patches = layers.Conv2D(256,(3,3),padding='same')(encoded_patches)
+	encoded_patches = layers.UpSampling2D(size=(image_size // 
+	encoded_patches.shape[1], image_size // encoded_patches.shape[2]),
+		interpolation="bilinear",
+	)(encoded_patches)
+	
+	encoded_patches = layers.Conv2D(20,(3,3),padding='same')(encoded_patches)
 
+	
 	outputs = encoded_patches
 		
 	return keras.Model(inputs=inputs, outputs=outputs)
